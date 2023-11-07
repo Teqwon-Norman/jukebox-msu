@@ -13,6 +13,8 @@ from jukebox.utils.remote_utils import download
 from jukebox.utils.torch_utils import freeze_model
 from jukebox.utils.dist_utils import print_all
 from jukebox.vqvae.vqvae import calculate_strides
+from jukebox.vqvae.vqvae import VQVAE
+
 import fire
 
 MODELS = {
@@ -71,17 +73,30 @@ def save_checkpoint(logger, name, model, opt, metrics, hps):
                 **metrics}, f'{logger.logdir}/checkpoint_{name}.pth.tar')
     return
 
-def restore_model(hps, model, checkpoint_path):
+def restore_model(model: t, checkpoint_path: str) -> None:
+    """
+    Restore a model's state and step information from a saved checkpoint file.
+
+    Args:
+        hps: Hyperparameters object containing configuration settings.
+        model: The PyTorch model to which the checkpoint should be applied.
+        checkpoint_path: The path to the saved checkpoint file.
+
+    This function loads the checkpoint file, updates the model's state with the 
+    saved model parameters, and sets the model's training step to the value saved 
+    in the checkpoint, if available.
+    """
+
     model.step = 0
-    if checkpoint_path != '':
-        checkpoint = load_checkpoint(checkpoint_path)
-        # checkpoint_hps = Hyperparams(**checkpoint['hps'])
-        # for k in set(checkpoint_hps.keys()).union(set(hps.keys())):
-        #     if checkpoint_hps.get(k, None) != hps.get(k, None):
-        #         print(k, "Checkpoint:", checkpoint_hps.get(k, None), "Ours:", hps.get(k, None))
-        checkpoint['model'] = {k[7:] if k[:7] == 'module.' else k: v for k, v in checkpoint['model'].items()}
-        model.load_state_dict(checkpoint['model'])
-        if 'step' in checkpoint: model.step = checkpoint['step']
+    if not checkpoint_path:
+        checkpoint = load_checkpoint(checkpoint_path) # Load saved checkpoint file
+        # Adjust the keys in the loaded model to match the model's structure.
+        checkpoint['model'] = {
+            k[7:] if k[:7] == 'module.' else k: v for k, v in checkpoint['model'].items()
+            }
+        model.load_state_dict(checkpoint['model']) # Load the model parameters from the checkpoint.
+        if 'step' in checkpoint:
+            model.step = checkpoint['step'] # Set the model's training step if available in the checkpoint.
 
 def restore_opt(opt, shd, checkpoint_path):
     if not checkpoint_path:
@@ -92,33 +107,64 @@ def restore_opt(opt, shd, checkpoint_path):
     if "step" in checkpoint:
         shd.step(checkpoint['step'])
 
-def make_vqvae(hps, device='cuda'):
-    from jukebox.vqvae.vqvae import VQVAE
-    block_kwargs = dict(width=hps.width, depth=hps.depth, m_conv=hps.m_conv,
-                        dilation_growth_rate=hps.dilation_growth_rate,
-                        dilation_cycle=hps.dilation_cycle,
-                        reverse_decoder_dilation=hps.vqvae_reverse_decoder_dilation)
+def make_vqvae(hps: Hyperparams, device='cuda') -> VQVAE:
+    """
+    Create and configure a VQVAE model based on the provided hyperparameters.
 
+    Args:
+        hps (Hyperparams): Hyperparameters object containing the configuration settings.
+        device (str, optional): The device on which to place the model, default is 'cuda'.
+
+    Returns:
+        VQVAE: The configured VQVAE model ready for training or evaluation.
+    """
+
+    block_kwargs = {
+        'width' : hps.width,
+        'depth' : hps.depth,
+        'm_conv' : hps.m_conv,
+        'dilation_growth_rate' : hps.dilation_growth_rate,
+        'dilation_cycle' : hps.dilation_cycle,
+        'reverse_decoder_dilation' : hps.vqvae_reverse_decoder_dilation
+    }
+
+    # If sample_length is not set, then it is calculated based on the sample_length_in_seconds.
     if not hps.sample_length:
         assert hps.sample_length_in_seconds != 0
-        downsamples = calculate_strides(hps.strides_t, hps.downs_t)
-        top_raw_to_tokens = np.prod(downsamples)
-        hps.sample_length = (hps.sample_length_in_seconds * hps.sr // top_raw_to_tokens) * top_raw_to_tokens
-        print(f"Setting sample length to {hps.sample_length} (i.e. {hps.sample_length/hps.sr} seconds) to be multiple of {top_raw_to_tokens}")
+        # calculate_strides calculates the downsampling factors
+        # calculates the product of downsampling factors.
+        top_raw_to_tokens = np.prod(calculate_strides(hps.strides_t, hps.downs_t))
+        hps.sample_length = (
+            hps.sample_length_in_seconds * hps.sr // top_raw_to_tokens
+            ) * top_raw_to_tokens
 
-    vqvae = VQVAE(input_shape=(hps.sample_length,1), levels=hps.levels, downs_t=hps.downs_t, strides_t=hps.strides_t,
-                  emb_width=hps.emb_width, l_bins=hps.l_bins,
-                  mu=hps.l_mu, commit=hps.commit,
-                  spectral=hps.spectral, multispectral=hps.multispectral,
-                  multipliers=hps.hvqvae_multipliers, use_bottleneck=hps.use_bottleneck,
-                  **block_kwargs)
+        print(f"Setting sample length to {hps.sample_length} \
+                (i.e. {hps.sample_length/hps.sr} seconds) \
+                to be multiple of {top_raw_to_tokens}")
+
+    vqvae = VQVAE(
+        input_shape=(hps.sample_length,1),
+        levels=hps.levels,
+        downs_t=hps.downs_t,
+        strides_t=hps.strides_t,
+        emb_width=hps.emb_width,
+        l_bins=hps.l_bins,
+        mu=hps.l_mu,
+        commit=hps.commit,
+        spectral=hps.spectral,
+        multispectral=hps.multispectral,
+        multipliers=hps.hvqvae_multipliers,
+        use_bottleneck=hps.use_bottleneck,
+        **block_kwargs
+    )
 
     vqvae = vqvae.to(device)
-    restore_model(hps, vqvae, hps.restore_vqvae)
+    restore_model(vqvae, hps.restore_vqvae)
+
     if hps.train and not hps.prior:
-        print_all(f"Loading vqvae in train mode")
+        print("Loading vqvae in train mode")
         if hps.restore_vqvae != '':
-            print_all("Reseting bottleneck emas")
+            print("Reseting bottleneck emas")
             for level, bottleneck in enumerate(vqvae.bottleneck.level_blocks):
                 num_samples = hps.sample_length
                 downsamples = calculate_strides(hps.strides_t, hps.downs_t)
@@ -126,7 +172,7 @@ def make_vqvae(hps, device='cuda'):
                 num_tokens = (num_samples // raw_to_tokens) * dist.get_world_size()
                 bottleneck.restore_k(num_tokens=num_tokens, threshold=hps.revival_threshold)
     else:
-        print_all(f"Loading vqvae in eval mode")
+        print("Loading vqvae in eval mode")
         vqvae.eval()
         freeze_model(vqvae)
     return vqvae

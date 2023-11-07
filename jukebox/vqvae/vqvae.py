@@ -5,7 +5,8 @@ import torch.nn as nn
 from jukebox.vqvae.encdec import Encoder, Decoder, assert_shape
 from jukebox.vqvae.bottleneck import NoBottleneck, Bottleneck
 from jukebox.utils.logger import average_metrics
-from jukebox.utils.audio_utils import spectral_convergence, spectral_loss, multispectral_loss, audio_postprocess
+from jukebox.utils.audio_utils import spectral_convergence, spectral_loss, \
+    multispectral_loss, audio_postprocess
 
 def dont_update(params):
     for param in params:
@@ -15,7 +16,22 @@ def update(params):
     for param in params:
         param.requires_grad = True
 
-def calculate_strides(strides, downs):
+def calculate_strides(strides: tuple[int], downs: tuple[int]):
+    """
+    Calculate the downsampling factors for each dimension based on the given strides 
+    and downsampling values.
+
+    Args:
+        strides (tuple[int]): Tuple of integers representing the strides used for downsampling 
+        in each dimension.
+        downs (tuple[int]): Tuple of integers representing the downsampling values for each 
+        dimension.
+
+    Returns:
+        List[int]: A list of integers, each element corresponding to the downsampling factor for 
+        the respective dimension.
+    """
+
     return [stride ** down for stride, down in zip(strides, downs)]
 
 def _loss_fn(loss_fn, x_target, x_pred, hps):
