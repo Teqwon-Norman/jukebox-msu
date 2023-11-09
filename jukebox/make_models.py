@@ -14,6 +14,8 @@ from jukebox.utils.torch_utils import freeze_model
 from jukebox.utils.dist_utils import print_all
 from jukebox.vqvae.vqvae import calculate_strides
 from jukebox.vqvae.vqvae import VQVAE
+from jukebox.prior.prior import SimplePrior
+
 
 import fire
 
@@ -28,7 +30,6 @@ memory_map_idx = 0
 def memory_map(storage, location):
     global memory_map_idx
     memory_map_idx += 1
-    #print(storage.size(), storage.element_size())
     s = 'disk_tensors/' + str(memory_map_idx) + '.bint'
     f = open(s,"wb")
     f.seek(storage.size()*storage.element_size()-1)
@@ -38,8 +39,25 @@ def memory_map(storage, location):
     del storage
     return new_storage
 
-def load_checkpoint(path):
+def load_checkpoint(path: str):
+    """
+    Load a checkpoint from a specified file path.
+
+    Args:
+        path (str): The path to the checkpoint file.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the loaded checkpoint data.
+
+    This function loads a checkpoint from the given file path.
+    If the file path starts with a specified remote prefix, it checks whether
+    the file exists locally and downloads it if necessary.
+
+    After loading the checkpoint, it also removes any temporary '.bint' files
+    and prints a message to indicate the successful restoration.
+    """
     restore = path
+
     if restore.startswith(REMOTE_PREFIX):
         remote_path = restore
         local_path = os.path.join(os.path.expanduser("~/.cache"), remote_path[len(REMOTE_PREFIX):])
@@ -47,19 +65,25 @@ def load_checkpoint(path):
             print("Downloading from azure")
             if not os.path.exists(os.path.dirname(local_path)):
                 os.makedirs(os.path.dirname(local_path))
+
             if not os.path.exists(local_path):
                 download(remote_path, local_path)
         restore = local_path
+
     dist.barrier()
     if not os.path.exists('disk_tensors/'):
         os.makedirs('disk_tensors/')
+
     checkpoint = t.load(restore, map_location=memory_map)
     files = glob.glob('disk_tensors/*.bint')
+
     for file in files:
         try:
             os.remove(file)
-        except Exception: print('cant remove .bint file')
-    print("Restored from {}".format(restore))
+        except Exception:
+            print('cant remove .bint file')
+
+    print(f"Restored from {restore}")
     return checkpoint
 
 def save_checkpoint(logger, name, model, opt, metrics, hps):
@@ -102,8 +126,10 @@ def restore_opt(opt, shd, checkpoint_path):
     if not checkpoint_path:
         return
     checkpoint = load_checkpoint(checkpoint_path)
+
     if "opt" in checkpoint:
         opt.load_state_dict(checkpoint['opt'])
+
     if "step" in checkpoint:
         shd.step(checkpoint['step'])
 
@@ -161,9 +187,11 @@ def make_vqvae(hps: Hyperparams, device='cuda') -> VQVAE:
     vqvae = vqvae.to(device)
     restore_model(vqvae, hps.restore_vqvae)
 
+    # configures the VQVAE model based on whether it is in training or evaluation mode and
+    # whether it is being restored from a checkpoint.
     if hps.train and not hps.prior:
         print("Loading vqvae in train mode")
-        if hps.restore_vqvae != '':
+        if not hps.restore_vqvae:
             print("Reseting bottleneck emas")
             for level, bottleneck in enumerate(vqvae.bottleneck.level_blocks):
                 num_samples = hps.sample_length
@@ -171,88 +199,153 @@ def make_vqvae(hps: Hyperparams, device='cuda') -> VQVAE:
                 raw_to_tokens = np.prod(downsamples[:level + 1])
                 num_tokens = (num_samples // raw_to_tokens) * dist.get_world_size()
                 bottleneck.restore_k(num_tokens=num_tokens, threshold=hps.revival_threshold)
+
     else:
+        # sets the VQVAE model to evaluation mode and freezes the model's parameters.
         print("Loading vqvae in eval mode")
         vqvae.eval()
         freeze_model(vqvae)
+
     return vqvae
 
 def make_prior(hps, vqvae, device='cuda'):
-    from jukebox.prior.prior import SimplePrior
+    """
+        Create and configure a SimplePrior instance for use in a hierarchical VQ-VAE model.
 
-    prior_kwargs = dict(input_shape=(hps.n_ctx,), bins=vqvae.l_bins,
-                        width=hps.prior_width, depth=hps.prior_depth, heads=hps.heads,
-                        attn_order=hps.attn_order, blocks=hps.blocks, spread=hps.spread,
-                        attn_dropout=hps.attn_dropout, resid_dropout=hps.resid_dropout, emb_dropout=hps.emb_dropout,
-                        zero_out=hps.zero_out, res_scale=hps.res_scale, pos_init=hps.pos_init,
-                        init_scale=hps.init_scale,
-                        m_attn=hps.m_attn, m_mlp=hps.m_mlp,
-                        checkpoint_res=hps.c_res if hps.train else 0, checkpoint_attn=hps.c_attn if hps.train else 0, checkpoint_mlp=hps.c_mlp if hps.train else 0)
+        Parameters:
+        - hps (namespace): Hyperparameters for configuring the SimplePrior.
+        - vqvae (VQVAE): An instance of the VQVAE model providing necessary information.
+        - device (str): The device to which the model should be sent ('cuda' for GPU, 'cpu' for CPU)
 
-    x_cond_kwargs = dict(out_width=hps.prior_width, init_scale=hps.init_scale,
-                         width=hps.cond_width, depth=hps.cond_depth, m_conv=hps.cond_m_conv,
-                         dilation_growth_rate=hps.cond_dilation_growth_rate, dilation_cycle=hps.cond_dilation_cycle,
-                         zero_out=hps.cond_zero_out, res_scale=hps.cond_res_scale,
-                         checkpoint_res=hps.cond_c_res)  # have to keep this else names wrong
+        Returns:
+        - SimplePrior: An instance of the SimplePrior class configured with
+        the specified hyperparameters.
 
-    y_cond_kwargs = dict(out_width=hps.prior_width, init_scale=hps.init_scale,
-                         y_bins=hps.y_bins, t_bins=hps.t_bins, sr= hps.sr, min_duration=hps.min_duration,
-                         max_duration=hps.max_duration, max_bow_genre_size=hps.max_bow_genre_size)
+        This function initializes a SimplePrior object, which serves as the prior distribution for
+        the latent codes in a hierarchical VQ-VAE model. It takes hyperparameters (`hps`)
+        and information from the VQVAE model (`vqvae`) to set up the prior. The configuration
+        includes parameters for the prior distribution, conditioning networks,
+        and additional options. The function also handles the loading and freezing of the model
+        based on the training mode.
+    """
+
+    prior_kwargs = {
+        "input_shape": (hps.n_ctx,),
+        "bins": vqvae.l_bins,
+        "width": hps.prior_width,
+        "depth": hps.prior_depth,
+        "heads": hps.heads,
+        "attn_order": hps.attn_order,
+        "blocks": hps.blocks,
+        "spread": hps.spread,
+        "attn_dropout": hps.attn_dropout,
+        "resid_dropout": hps.resid_dropout,
+        "emb_dropout": hps.emb_dropout,
+        "zero_out": hps.zero_out,
+        "res_scale": hps.res_scale,
+        "pos_init": hps.pos_init,
+        "init_scale": hps.init_scale,
+        "m_attn": hps.m_attn,
+        "m_mlp": hps.m_mlp,
+        "checkpoint_res": hps.c_res if hps.train else 0,
+        "checkpoint_attn": hps.c_attn if hps.train else 0,
+        "checkpoint_mlp": hps.c_mlp if hps.train else 0
+    }
+
+    x_cond_kwargs = {
+        "out_width": hps.prior_width,
+        "init_scale": hps.init_scale,
+        "width": hps.cond_width,
+        "depth": hps.cond_depth,
+        "m_conv": hps.cond_m_conv,
+        "dilation_growth_rate": hps.cond_dilation_growth_rate,
+        "dilation_cycle": hps.cond_dilation_cycle,
+        "zero_out": hps.cond_zero_out,
+        "res_scale": hps.cond_res_scale,
+        "checkpoint_res": hps.cond_c_res
+    }  # have to keep this else names wrong
+
+    y_cond_kwargs = {
+        "out_width": hps.prior_width,
+        "init_scale": hps.init_scale,
+        "y_bins": hps.y_bins,
+        "t_bins": hps.t_bins,
+        "sr": hps.sr,
+        "min_duration": hps.min_duration,
+        "max_duration": hps.max_duration,
+        "max_bow_genre_size": hps.max_bow_genre_size
+    }
 
     if hps.use_tokens and not hps.single_enc_dec:
-        prime_kwargs = dict(use_tokens=hps.use_tokens, prime_loss_fraction=hps.prime_loss_fraction,
-                            n_tokens=hps.n_tokens, bins=hps.n_vocab,
-                            width=hps.prime_width, depth=hps.prime_depth, heads=hps.prime_heads,
-                            attn_order=hps.prime_attn_order, blocks=hps.prime_blocks, spread=hps.prime_spread,
-                            attn_dropout=hps.prime_attn_dropout, resid_dropout=hps.prime_resid_dropout,
-                            emb_dropout=hps.prime_emb_dropout,
-                            zero_out=hps.prime_zero_out, res_scale=hps.prime_res_scale,
-                            pos_init=hps.prime_pos_init, init_scale=hps.prime_init_scale,
-                            m_attn=hps.prime_m_attn, m_mlp=hps.prime_m_mlp,
-                            checkpoint_res=hps.prime_c_res if hps.train else 0, checkpoint_attn=hps.prime_c_attn if hps.train else 0,
-                            checkpoint_mlp=hps.prime_c_mlp if hps.train else 0)
+        prime_kwargs = {
+            "use_tokens": hps.use_tokens,
+            "prime_loss_fraction": hps.prime_loss_fraction,
+            "n_tokens": hps.n_tokens,
+            "bins": hps.n_vocab,
+            "width": hps.prime_width,
+            "depth": hps.prime_depth,
+            "heads": hps.prime_heads,
+            "attn_order": hps.prime_attn_order,
+            "blocks": hps.prime_blocks,
+            "spread": hps.prime_spread,
+            "attn_dropout": hps.prime_attn_dropout,
+            "resid_dropout": hps.prime_resid_dropout,
+            "emb_dropout": hps.prime_emb_dropout,
+            "zero_out": hps.prime_zero_out,
+            "res_scale": hps.prime_res_scale,
+            "pos_init": hps.prime_pos_init,
+            "init_scale": hps.prime_init_scale,
+            "m_attn": hps.prime_m_attn,
+            "m_mlp": hps.prime_m_mlp,
+            "checkpoint_res": hps.prime_c_res if hps.train else 0,
+            "checkpoint_attn": hps.prime_c_attn if hps.train else 0,
+            "checkpoint_mlp": hps.prime_c_mlp if hps.train else 0
+        }
+
     else:
-        prime_kwargs = dict(use_tokens=hps.use_tokens, prime_loss_fraction=hps.prime_loss_fraction,
-                            n_tokens=hps.n_tokens, bins=hps.n_vocab)
+        prime_kwargs = {
+            "use_tokens": hps.use_tokens,
+            "prime_loss_fraction": hps.prime_loss_fraction,
+            "n_tokens": hps.n_tokens,
+            "bins": hps.n_vocab
+        }
 
     # z_shapes for other levels given this level gets n_ctx codes
-    rescale = lambda z_shape: (z_shape[0]*hps.n_ctx//vqvae.z_shapes[hps.level][0],)
-    z_shapes = [rescale(z_shape) for z_shape in vqvae.z_shapes]
+    rescale = lambda z_shape: (z_shape[0] * hps.n_ctx // vqvae.z_shapes[hps.level][0], )
+    z_shapes = [ rescale(z_shape) for z_shape in vqvae.z_shapes ]
 
-    prior = SimplePrior(z_shapes=z_shapes,
-                        l_bins=vqvae.l_bins,
-                        encoder=vqvae.encode,
-                        decoder=vqvae.decode,
-                        level=hps.level,
-                        downs_t=vqvae.downs_t,
-                        strides_t=vqvae.strides_t,
-                        labels=hps.labels,
-                        prior_kwargs=prior_kwargs,
-                        x_cond_kwargs=x_cond_kwargs,
-                        y_cond_kwargs=y_cond_kwargs,
-                        prime_kwargs=prime_kwargs,
-                        copy_input=hps.copy_input,
-                        labels_v3=hps.labels_v3,
-                        merged_decoder=hps.merged_decoder,
-                        single_enc_dec=hps.single_enc_dec,
-                        device=device)
+    prior = SimplePrior(
+        z_shapes=z_shapes,
+        l_bins=vqvae.l_bins,
+        encoder=vqvae.encode,
+        decoder=vqvae.decode,
+        level=hps.level,
+        downs_t=vqvae.downs_t,
+        strides_t=vqvae.strides_t,
+        labels=hps.labels,
+        prior_kwargs=prior_kwargs,
+        x_cond_kwargs=x_cond_kwargs,
+        y_cond_kwargs=y_cond_kwargs,
+        prime_kwargs=prime_kwargs,
+        copy_input=hps.copy_input,
+        labels_v3=hps.labels_v3,
+        merged_decoder=hps.merged_decoder,
+        single_enc_dec=hps.single_enc_dec,
+        device=device
+    )
 
     prior.alignment_head = hps.get('alignment_head', None)
     prior.alignment_layer = hps.get('alignment_layer', None)
+    restore_model(prior, hps.restore_prior)
 
-    #if hps.fp16_params:
-    #    print_all("Converting to fp16 params")
-    #    from jukebox.transformer.ops import _convert_conv_weights_to_fp16
-    #    prior.apply(_convert_conv_weights_to_fp16)
-    #prior = prior.to(device)
-    restore_model(hps, prior, hps.restore_prior)
     if hps.train:
-        print_all(f"Loading prior in train mode")
-        pass
+        print("Loading prior in train mode")
+
     else:
-        print_all(f"Loading prior in eval mode")
+        print("Loading prior in eval mode")
         prior.eval()
         freeze_model(prior)
+
     return prior
 
 def make_model(model, device, hps, levels=None):

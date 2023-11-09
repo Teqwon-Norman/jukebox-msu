@@ -18,6 +18,21 @@ def zero_grad(model):
             p.grad = None
 
 def empty_cache():
+    """
+        Clear GPU memory by collecting garbage and emptying the CUDA memory cache.
+
+        This function utilizes the `gc.collect()` method to perform garbage collection, 
+        freeing up any unreferenced objects
+
+        in the Python memory space. Additionally, it calls `torch.cuda.empty_cache()` 
+        to release cached memory held by the CUDA memory allocator in PyTorch, providing 
+        a way to explicitly clear GPU memory.
+
+        Note: Use this function when you want to manually release GPU memory in a 
+        PyTorch-based application, especially in situations where automatic garbage 
+        collection may not be sufficient.
+    """
+
     gc.collect()
     t.cuda.empty_cache()
 

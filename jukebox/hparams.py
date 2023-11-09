@@ -2,25 +2,66 @@ HPARAMS_REGISTRY = {}
 DEFAULTS = {}
 
 class Hyperparams(dict):
+    """
+        Dictionary-based container for hyperparameters with attribute-style access.
+
+        - This class extends the built-in `dict` class to provide a convenient way to 
+        access and modify hyperparameters
+
+        - using attribute syntax (e.g., `obj.attribute`) instead of traditional 
+        dictionary syntax (`obj['attribute']`).
+        
+        Methods:
+        - `__getattr__(self, attr)`: Retrieves the value of the specified attribute.
+        - `__setattr__(self, attr, value)`: Sets the value of the specified attribute.
+    """
+
     def __getattr__(self, attr):
         return self[attr]
 
     def __setattr__(self, attr, value):
         self[attr] = value
 
-def setup_hparams(hparam_set_names, kwargs):
+def setup_hparams(hparam_set_names: tuple[str, dict], kwargs: dict):
+    """
+        Set up hyperparameters by combining sets from the registry, defaults,
+        and additional keyword arguments.
+
+        Parameters:
+        - hparam_set_names (str or tuple): Names of hyperparameter sets to use,
+        separated by commas if multiple.
+        - kwargs (dict): Additional keyword arguments for hyperparameters.
+
+        Returns:
+        - Hyperparams: An instance of the Hyperparams class containing
+        the configured hyperparameters.
+
+        This function initializes a Hyperparams instance by combining hyperparameter 
+        sets from the registry, default values,
+        and any additional keyword arguments provided. It ensures that all required 
+        hyperparameters are present and returns a configured instance for use in the application.
+
+        Hyperparams instances support attribute-style access (e.g., hparams.attribute) 
+        for convenient retrieval and modification of hyperparameter values. If a specified 
+        hyperparameter is not present in the default arguments, a ValueError is raised.
+    """
+
     H = Hyperparams()
+
     if not isinstance(hparam_set_names, tuple):
         hparam_set_names = hparam_set_names.split(",")
+
     hparam_sets = [HPARAMS_REGISTRY[x.strip()] for x in hparam_set_names if x] + [kwargs]
     for k, v in DEFAULTS.items():
         H.update(v)
+
     for hps in hparam_sets:
         for k in hps:
             if k not in H:
                 raise ValueError(f"{k} not in default args")
         H.update(**hps)
     H.update(**kwargs)
+
     return H
 
 # Teeny for testing
