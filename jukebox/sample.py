@@ -200,6 +200,7 @@ def sample_level(zs, labels, sampling_kwargs, level, prior, total_length, hop_le
 def _sample(zs, labels, sampling_kwargs, priors, sample_levels, hps, device='cuda'):
     alignments = None
     for level in reversed(sample_levels):
+        print("thissssss issssss theeeeeee samplevellllllllsss", sample_levels)
         prior = priors[level]
         prior.c_to(device)
         empty_cache()
