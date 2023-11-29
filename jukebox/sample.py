@@ -230,6 +230,7 @@ def _sample(
         prior = priors[level]
         print("PRIOR-PRIOR-PRIOR: ", prior)
         print("PRIORS - PRIORS - PRIORS: ", priors, '\n', priors[level])
+
         prior.c_to(device)
         empty_cache()
 
@@ -240,7 +241,7 @@ def _sample(
             hop_length = prior.n_ctx
         else:
             hop_length = int(hps.hop_fraction[level] * prior.n_ctx)
-            if not prior.cond_downsample:
+            if prior.cond_downsample != None:
                 remainder = hop_length % prior.cond_downsample
                 if remainder != 0:
                     hop_length += prior.cond_downsample - remainder
