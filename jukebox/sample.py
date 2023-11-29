@@ -227,8 +227,9 @@ def _sample(
 
     alignments = None
     for level in reversed(sample_levels):
-        print("thissssss issssss theeeeeee samplevellllllllsss", sample_levels)
         prior = priors[level]
+        print("PRIOR-PRIOR-PRIOR: ", prior)
+        print("PRIORS - PRIORS - PRIORS: ", priors, '\n', priors[level])
         prior.c_to(device)
         empty_cache()
 
