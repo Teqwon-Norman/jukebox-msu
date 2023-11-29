@@ -3,6 +3,7 @@ import torch as t
 import torch.nn.functional as F
 import jukebox.utils.dist_adapter as dist
 
+from typing import Any, Optional
 from jukebox.hparams import Hyperparams
 from jukebox.data.labels import EmptyLabeller
 from jukebox.utils.torch_utils import empty_cache
@@ -13,6 +14,7 @@ from jukebox.save_html import save_html
 from jukebox.utils.sample_utils import split_batch, get_starts
 from jukebox.utils.dist_utils import print_once
 from jukebox.utils.logger import ctqdm
+from jukebox.prior.prior import SimplePrior
 import fire
 
 def get_logdir(hps, level):
@@ -197,7 +199,32 @@ def sample_level(zs, labels, sampling_kwargs, level, prior, total_length, hop_le
     return zs
 
 # Sample multiple levels
-def _sample(zs, labels, sampling_kwargs, priors, sample_levels, hps, device='cuda'):
+def _sample(
+        zs: list[t.Tensor],
+        labels: list[Optional[Any]],
+        sampling_kwargs: list[dict[Any]],
+        priors: list[Optional[SimplePrior]],
+        sample_levels: list[int],
+        hps: Hyperparams,
+        device='cuda'
+) -> list[t.Tensor]:
+    """
+        Samples data points 'zs' using the provided labels, sampling parameters,
+        priors, and hyperparameters for different sample levels.
+
+        Args:
+        - zs (List[t.Tensor]): The data points to be sampled.
+        - labels (List[Optional[Any]]): Labels associated with the data points.
+        - sampling_kwargs (List[dict[Any]]): Sampling parameters for different levels.
+        - priors (List[Optional[SimplePrior]]): Prior information used for sampling.
+        - sample_levels (List[int]): Levels to be sampled.
+        - hps (Hyperparams): Hyperparameters for the sampling process.
+        - device (str): Device to use for computation (default: 'cuda').
+
+        Returns:
+        - List[t.Tensor]: The sampled data points.
+    """
+
     alignments = None
     for level in reversed(sample_levels):
         prior = priors[level]
@@ -206,36 +233,51 @@ def _sample(zs, labels, sampling_kwargs, priors, sample_levels, hps, device='cud
 
         # Set correct total_length, hop_length, labels and sampling_kwargs for level
         assert hps.sample_length % prior.raw_to_tokens == 0, f"Expected sample_length {hps.sample_length} to be multiple of {prior.raw_to_tokens}"
-        total_length = hps.sample_length//prior.raw_to_tokens
+        total_length = hps.sample_length // prior.raw_to_tokens
         if level != hps.levels - 1 and isinstance(hps.hop_fraction[level], int) and hps.hop_fraction[level] >= 1:
             hop_length = prior.n_ctx
         else:
-            hop_length = int(hps.hop_fraction[level]*prior.n_ctx)
-            #print(hop_length)
-            if prior.cond_downsample != None:
+            hop_length = int(hps.hop_fraction[level] * prior.n_ctx)
+            if not prior.cond_downsample:
                 remainder = hop_length % prior.cond_downsample
-                #print(remainder, hop_length, prior.cond_downsample)
                 if remainder != 0:
                     hop_length += prior.cond_downsample - remainder
 
         logdir = get_logdir(hps, level)
 
-        zs = sample_level(zs, labels[level], sampling_kwargs[level], level, prior, total_length, hop_length, hps)
+        zs = sample_level(
+            zs,
+            labels[level],
+            sampling_kwargs[level],
+            level,
+            prior,
+            total_length,
+            hop_length,
+            hps)
 
         empty_cache()
+
         # Decode sample
         x = prior.decode(zs[level:], start_level=level, bs_chunks=zs[level].shape[0])
 
         if level != 2:
             prior.cpu()
+
         del prior
         del priors[level]
         empty_cache()
 
-        t.save(dict(zs=zs, labels=labels, sampling_kwargs=sampling_kwargs, x=x), f"{logdir}/data.pth.tar")
+        t.save(dict(
+            zs=zs,
+            labels=labels,
+            sampling_kwargs=sampling_kwargs,
+            x=x),
+            f"{logdir}/data.pth.tar")
+
         save_wav(logdir, x, hps.sr)
-        #if alignments is None and priors[-1] is not None and priors[-1].n_tokens > 0 and not isinstance(priors[-1].labeller, EmptyLabeller):
-        #    alignments = get_alignment(x, zs, labels[-1], priors[-1], sampling_kwargs[-1]['fp16'], hps)
+
+        # if alignments is None and priors[-1] is not None and priors[-1].n_tokens > 0 and not isinstance(priors[-1].labeller, EmptyLabeller):
+        # alignments = get_alignment(x, zs, labels[-1], priors[-1], sampling_kwargs[-1]['fp16'], hps)
         save_html(logdir, x, zs, labels[-1], alignments, hps)
     return zs
 
@@ -253,7 +295,28 @@ def continue_sample(zs, labels, sampling_kwargs, priors, hps):
     return zs
 
 # Upsample given already generated upper-level codes
-def upsample(zs, labels, sampling_kwargs, priors, hps):
+def upsample(
+        zs: list[t.Tensor],
+        labels: list[Optional[Any]],
+        sampling_kwargs: list[dict[Any]],
+        priors, hps: Hyperparams
+):
+
+    """
+        Performs upsampling on a list of data points ('zs') using provided labels,
+        sampling parameters, priors, and hyperparameters.
+
+        Args:
+        - zs (List[t.Tensor]): List of data points to be upsampled.
+        - labels (List[Optional[Any]]): Labels associated with the data points.
+        - sampling_kwargs (List[dict[Any]]): Sampling parameters for the upsampling process.
+        - priors: Prior information used for upsampling.
+        - hps (Hyperparams): Hyperparameters for the upsampling process.
+
+        Returns:
+        - List[t.Tensor]: The upsampled data points.
+    """
+
     sample_levels = list(range(len(priors) - 1))
     zs = _sample(zs, labels, sampling_kwargs, priors, sample_levels, hps)
     return zs
@@ -266,18 +329,36 @@ def primed_sample(x, labels, sampling_kwargs, priors, hps):
     return zs
 
 # Load `duration` seconds of the given audio files to use as prompts
-def load_prompts(audio_files, duration, hps):
+def load_prompts(audio_files: list[str], duration: int, hps: Hyperparams):
+    """
+        Loads audio prompts from a list of audio files, ensuring a specific duration
+        and number of samples based on the provided hyperparameters.
+
+        Args:
+        - audio_files (List[str]): List of paths to audio files.
+        - duration (int): Desired duration (in seconds) for each audio prompt.
+        - hps (Hyperparams): Hyperparameters for the loading process.
+
+        Returns:
+        - t.Tensor: Tensor containing the loaded audio prompts.
+    """
+
     xs = []
+    # Load audio prompts from each file in the list
     for audio_file in audio_files:
+        # Load the audio and transform it
         x = load_audio(audio_file, sr=hps.sr, duration=duration, offset=0.0, mono=True)
-        x = x.T # CT -> TC
+        x = x.T  # Transpose the loaded audio (CT -> TC)
         xs.append(x)
+    # Extend the list of audio prompts to meet the desired number of samples
     while len(xs) < hps.n_samples:
         xs.extend(xs)
+    # Trim the list to match the desired number of samples
     xs = xs[:hps.n_samples]
+    # Convert the list of audio prompts into a PyTorch tensor
     x = t.stack([t.from_numpy(x) for x in xs])
-    #x = x.to('cuda', non_blocking=True)
     return x
+
 
 # Load codes from previous sampling run
 def load_codes(codes_file, duration, priors, hps):
